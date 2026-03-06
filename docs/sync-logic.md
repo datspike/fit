@@ -621,6 +621,37 @@ remote files = {
 - User maintains control: Local files are never overwritten
 - Clear conflict markers: Remote versions in `_fit/` are easy to identify
 
+### Mobile-first archive bootstrap for truly empty vaults
+
+When FIT detects a **truly empty local bootstrap** (`localSha = {}`, `lastFetchedRemoteSha = {}`, no prior synced commit, and no local files yet), it can switch the remote → local part of initial sync to a GitHub `zipball` snapshot instead of reading every blob individually.
+
+FIT only takes this path when all of these are true:
+- Remote tracked file count is `<= 2500`
+- Total tracked blob size from the Git tree is `<= 80 MiB`
+- Largest tracked blob is `<= 20 MiB`
+- The sync is a clean bootstrap, not a mixed conflict-resolution case
+
+If any threshold is exceeded, FIT **does not** use archive bootstrap. It logs the specific fallback reason and continues with the regular per-file sync path optimized for mobile.
+
+### Archive bootstrap checkpoint / resume
+
+Archive bootstrap persists a checkpoint until it fully succeeds:
+- `targetCommitSha`
+- current `phase` (`download`, `extract`, `write`)
+- `completedPaths`
+- `writtenLocalSha`
+- `updatedAt`
+
+If Obsidian is interrupted mid-bootstrap and the remote commit is unchanged, FIT resumes from the checkpoint and skips already written paths. If the remote commit changes, FIT discards the checkpoint and logs the reason before continuing with the standard sync flow.
+
+### Rate limit messaging
+
+When GitHub returns a rate-limit response and includes `x-ratelimit-reset`, FIT formats the retry time in the device/runtime local timezone and shows:
+
+- `GitHub rate limit reached. Try again after YYYY-MM-DD HH:MM local time.`
+
+If GitHub does not provide a reset timestamp, FIT falls back to a shorter `GitHub rate limit reached.` message.
+
 ## SHA Computation Strategy
 
 FIT uses a specialized SHA computation approach during sync operations to maximize performance and avoid race conditions.

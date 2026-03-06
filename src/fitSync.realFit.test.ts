@@ -19,6 +19,7 @@ import { fitLogger } from './logger';
 import { FileContent } from './util/contentEncoding';
 import { BlobSha, CommitSha } from './util/hashing';
 import FitNotice from './fitNotice';
+import { ARCHIVE_BOOTSTRAP_LIMITS } from './util/archiveBootstrap';
 
 describe('FitSync', () => {
 	let localVault: FakeLocalVault;
@@ -1502,6 +1503,112 @@ describe('FitSync', () => {
 				],
 				clash: []
 			});
+		});
+	});
+
+	describe('Archive bootstrap initial sync', () => {
+		beforeEach(() => {
+			localStoreState.lastFetchedCommitSha = null;
+		});
+
+		it('should use archive bootstrap for empty vault under threshold', async () => {
+			const fitSync = createFitSync();
+			const archiveSpy = vi.spyOn(remoteVault as any, 'downloadArchiveZipball');
+			await remoteVault.setFile('note.md', 'Hello from archive bootstrap');
+
+			const mockNotice = createMockNotice();
+			const result = await syncAndHandleResult(fitSync, mockNotice);
+
+			expect(result).toEqual(expect.objectContaining({ success: true }));
+			expect(archiveSpy).toHaveBeenCalledTimes(1);
+			expect(localVault.getAllFilesAsRaw()).toMatchObject({
+				'note.md': 'Hello from archive bootstrap'
+			});
+			expect(localStoreState.lastFetchedCommitSha).toBe(remoteVault.getCommitSha());
+			expect(localStoreState.archiveBootstrap).toBeNull();
+			expect(mockNotice._calls).toEqual([
+				{ method: 'setMessage', args: ['Checking for changes...'] },
+				{ method: 'setMessage', args: ['Downloading initial snapshot'] },
+				{ method: 'setMessage', args: ['Writing remote changes to local'] },
+				{ method: 'setMessage', args: ['Sync successful'] }
+			]);
+		});
+
+		it('should show fallback warning when archive bootstrap exceeds threshold', async () => {
+			const fitSync = createFitSync();
+			await remoteVault.setFile('note.md', 'regular fallback');
+			(remoteVault as any).getTrackedTreeMetrics = vi.fn().mockResolvedValue({
+				remoteTrackedFileCount: ARCHIVE_BOOTSTRAP_LIMITS.maxFiles + 1,
+				remoteTrackedBlobBytes: 10,
+				largestTrackedBlobBytes: 10,
+			});
+			const stickyWarningSpy = vi.spyOn(fitSync as any, 'showStickyWarning').mockImplementation(() => {});
+
+			const mockNotice = createMockNotice();
+			const result = await syncAndHandleResult(fitSync, mockNotice);
+
+			expect(result).toEqual(expect.objectContaining({ success: true }));
+			expect(stickyWarningSpy).toHaveBeenCalledWith(expect.stringContaining('Archive bootstrap was skipped'));
+			expect(mockNotice._calls).not.toContainEqual({ method: 'setMessage', args: ['Downloading initial snapshot'] });
+			expect(localVault.getAllFilesAsRaw()).toMatchObject({ 'note.md': 'regular fallback' });
+		});
+
+		it('should resume archive bootstrap from checkpoint on same commit', async () => {
+			const fitSync = createFitSync();
+			for (let index = 0; index <= ARCHIVE_BOOTSTRAP_LIMITS.writeBatchSize; index++) {
+				await remoteVault.setFile(`${String(index).padStart(3, '0')}.md`, `file ${index}`);
+			}
+			localVault.setMockWriteFile(async (path) => {
+				if (path === '100.md') {
+					throw new Error('disk full');
+				}
+			});
+
+			const failedNotice = createMockNotice();
+			const failedResult = await fitSync.sync(failedNotice as any);
+			expect(failedResult).toEqual(expect.objectContaining({ success: false }));
+			expect(localStoreState.archiveBootstrap?.completedPaths).toHaveLength(ARCHIVE_BOOTSTRAP_LIMITS.writeBatchSize);
+			localVault.setMockWriteFile(null);
+
+			const resumedNotice = createMockNotice();
+			const resumedResult = await syncAndHandleResult(fitSync, resumedNotice);
+
+			expect(resumedResult).toEqual(expect.objectContaining({ success: true }));
+			expect(Object.keys(localVault.getAllFilesAsRaw())).toHaveLength(ARCHIVE_BOOTSTRAP_LIMITS.writeBatchSize + 1);
+			expect(localStoreState.archiveBootstrap).toBeNull();
+		});
+
+		it('should discard archive checkpoint when commit changes', async () => {
+			localStoreState.archiveBootstrap = {
+				targetCommitSha: 'stale-commit' as CommitSha,
+				phase: 'write',
+				completedPaths: ['done.md'],
+				writtenLocalSha: { 'done.md': 'sha-done' as BlobSha },
+				updatedAt: new Date().toISOString(),
+			};
+			localVault.setFile('done.md', 'partial local file');
+			await remoteVault.setFile('fresh.md', 'fresh remote file');
+			(remoteVault as any).commitSha = 'fresh-commit';
+
+			const fitSync = createFitSync();
+			const logSpy = vi.spyOn(fitLogger, 'log');
+			const mockNotice = createMockNotice();
+			await syncAndHandleResult(fitSync, mockNotice);
+
+			expect(localStoreState.archiveBootstrap).toBeNull();
+			expect(logSpy).toHaveBeenCalledWith(
+				'[FitSync] Discarding archive bootstrap checkpoint due to commit mismatch',
+				expect.objectContaining({ checkpointCommitSha: 'stale-commit', remoteCommitSha: 'fresh-commit' })
+			);
+		});
+
+		it('should format rate limit retry time for user-facing error', () => {
+			const fitSync = createFitSync();
+			const error = VaultError.network('GitHub rate limit reached', {
+				rateLimitResetAt: '2026-03-07T09:15:00.000Z'
+			});
+
+			expect(fitSync.getSyncErrorMessage(error)).toMatch(/^GitHub rate limit reached\. Try again after \d{4}-\d{2}-\d{2} \d{2}:\d{2} local time\.$/);
 		});
 	});
 

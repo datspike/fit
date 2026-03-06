@@ -11,6 +11,9 @@ import { FilePath } from './util/filePath';
 import { BlobSha, CommitSha, computeSha1, TreeSha } from "./util/hashing";
 import { LocalVault } from './localVault';
 import { fitLogger } from './logger';
+import { zipSync } from 'fflate';
+import { ArchiveBootstrapTreeMetrics } from './util/archiveBootstrap';
+import { contentToArrayBuffer } from './util/obsidianHelpers';
 
 /**
  * Test stub for TFile that can be constructed with just a path.
@@ -737,6 +740,7 @@ export class FakeRemoteVault implements IVault<"remote"> {
 	private blobShas: Map<BlobSha, Base64Content> = new Map(); // blob SHA -> content
 	private commitSha: CommitSha = 'initial-commit' as CommitSha;
 	private failureError: Error | null = null;
+	private archiveDownloadFailure: Error | null = null;
 	private owner: string;
 	private repo: string;
 	private branch: string;
@@ -754,11 +758,19 @@ export class FakeRemoteVault implements IVault<"remote"> {
 		this.failureError = error;
 	}
 
+	setArchiveDownloadFailure(error: Error): void {
+		this.archiveDownloadFailure = error;
+	}
+
 	/**
 	 * Clear any pending failure.
 	 */
 	clearFailure(): void {
 		this.failureError = null;
+	}
+
+	clearArchiveDownloadFailure(): void {
+		this.archiveDownloadFailure = null;
 	}
 
 	/**
@@ -878,6 +890,38 @@ export class FakeRemoteVault implements IVault<"remote"> {
 		}
 		// Convert to base64 to match GitHub API behavior.
 		return FileContent.fromBase64(content.toBase64());
+	}
+
+	async getTrackedTreeMetrics(): Promise<ArchiveBootstrapTreeMetrics> {
+		let remoteTrackedFileCount = 0;
+		let remoteTrackedBlobBytes = 0;
+		let largestTrackedBlobBytes = 0;
+
+		for (const content of this.files.values()) {
+			const size = contentToArrayBuffer(content.toBase64()).byteLength;
+			remoteTrackedFileCount += 1;
+			remoteTrackedBlobBytes += size;
+			largestTrackedBlobBytes = Math.max(largestTrackedBlobBytes, size);
+		}
+
+		return { remoteTrackedFileCount, remoteTrackedBlobBytes, largestTrackedBlobBytes };
+	}
+
+	async downloadArchiveZipball(): Promise<ArrayBuffer> {
+		if (this.archiveDownloadFailure) {
+			const error = this.archiveDownloadFailure;
+			this.clearArchiveDownloadFailure();
+			throw error;
+		}
+
+		const zipEntries = Object.fromEntries(
+			Array.from(this.files.entries()).map(([path, content]) => [
+				`repo-${this.commitSha}/${path}`,
+				new Uint8Array(contentToArrayBuffer(content.toBase64()))
+			])
+		);
+		const zipped = zipSync(zipEntries);
+		return zipped.buffer.slice(zipped.byteOffset, zipped.byteOffset + zipped.byteLength) as ArrayBuffer;
 	}
 
 	async applyChanges(

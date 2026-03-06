@@ -59,6 +59,8 @@ export const Platform = {
 	isMobile: false,
 };
 
+export const requestUrl = vi.fn();
+
 // ========================================================
 // SETTINGS APIS
 // ========================================================

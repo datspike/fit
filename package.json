@@ -53,6 +53,7 @@
 		"wdio-obsidian-service": "^2.1.6"
 	},
 	"dependencies": {
+		"fflate": "^0.8.2",
 		"@octokit/core": "^7.0.6",
 		"@octokit/plugin-retry": "^8.0.3"
 	},

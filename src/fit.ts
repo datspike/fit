@@ -11,7 +11,7 @@ import { Vault } from "obsidian";
 import { LocalVault } from "./localVault";
 import { RemoteGitHubVault } from "./remoteGitHubVault";
 import { fitLogger } from "./logger";
-import { CommitSha } from "./util/hashing";
+import { CommitSha, TreeSha } from "./util/hashing";
 
 /**
  * Coordinator for local vault and remote repository access with sync state management.
@@ -32,6 +32,7 @@ export class Fit {
 	localSha: FileStates;                   // Cache of local file SHAs
 	lastFetchedCommitSha: CommitSha | null; // Last synced commit SHA
 	lastFetchedRemoteSha: FileStates;       // Cache of remote file SHAs
+	archiveBootstrap: LocalStores['archiveBootstrap'];
 	localVault: LocalVault;                 // Local vault (tracks local file state)
 	remoteVault: RemoteGitHubVault;
 
@@ -82,6 +83,7 @@ export class Fit {
 		this.localSha = localStore.localSha;
 		this.lastFetchedCommitSha = localStore.lastFetchedCommitSha;
 		this.lastFetchedRemoteSha = localStore.lastFetchedRemoteSha;
+		this.archiveBootstrap = localStore.archiveBootstrap ?? null;
 		// Detect potentially corrupted/suspicious cache states
 		const localCount = Object.keys(this.localSha).length;
 		const remoteCount = Object.keys(this.lastFetchedRemoteSha).length;
@@ -187,9 +189,9 @@ export class Fit {
 	 *
 	 * @returns Remote changes, current state, and the commit SHA of the fetched state
 	 */
-	async getRemoteChanges(): Promise<{changes: FileChange[], state: FileStates, commitSha: CommitSha}> {
+	async getRemoteChanges(): Promise<{changes: FileChange[], state: FileStates, commitSha: CommitSha, treeSha: TreeSha}> {
 		fitLogger.log('.. ☁️ [RemoteVault] Fetching from GitHub...');
-		const { state, commitSha } = await this.remoteVault.readFromSource();
+		const { state, commitSha, treeSha } = await this.remoteVault.readFromSource();
 		if (!commitSha) {
 			throw new Error("Expected RemoteGitHubVault to provide commitSha");
 		}
@@ -205,7 +207,7 @@ export class Fit {
 			});
 		}
 
-		return { changes, state, commitSha };
+		return { changes, state, commitSha, treeSha };
 	}
 
 	getClashedChanges(localChanges: FileChange[], remoteChanges:FileChange[]): Array<FileClash> {

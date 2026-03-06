@@ -9,6 +9,7 @@ import { FakeOctokit } from "./testUtils";
 import { __setMockOctokitInstance } from "./__mocks__/@octokit/core";
 import { FileContent } from "./util/contentEncoding";
 import { fitLogger } from "./logger";
+import { requestUrl } from 'obsidian';
 
 const COMMIT123_SHA = "commit123" as CommitSha;
 const COMMIT456_SHA = "commit456" as CommitSha;
@@ -39,12 +40,74 @@ describe("RemoteGitHubVault", () => {
 		);
 	});
 
-	afterEach(() => {
+		afterEach(() => {
 		// Reset mock to prevent test pollution
 		__setMockOctokitInstance(null);
+		(requestUrl as unknown as { mockReset: () => void }).mockReset();
 	});
 
 	describe("Read Operations", () => {
+		describe('archive bootstrap helpers', () => {
+			it('should parse tree size metrics from blob entries', async () => {
+				fakeOctokit.setupInitialState(COMMIT123_SHA, TREE456_SHA, [
+					{ path: 'a.md', type: 'blob', mode: '100644', sha: BLOB1_SHA, size: 12 },
+					{ path: 'folder', type: 'tree', mode: '040000', sha: TREE456_SHA },
+					{ path: 'b.bin', type: 'blob', mode: '100644', sha: BLOB2_SHA, size: 25 },
+				]);
+
+				expect(await vault.getTrackedTreeMetrics(TREE456_SHA)).toEqual({
+					remoteTrackedFileCount: 2,
+					remoteTrackedBlobBytes: 37,
+					largestTrackedBlobBytes: 25,
+				});
+			});
+
+			it('should download archive zipball through requestUrl', async () => {
+				const payload = new TextEncoder().encode('zip bytes').buffer;
+				(requestUrl as unknown as { mockResolvedValue: (value: unknown) => void }).mockResolvedValue({
+					status: 200,
+					arrayBuffer: payload,
+					headers: {},
+				});
+
+				const result = await vault.downloadArchiveZipball(COMMIT123_SHA);
+
+				expect(new Uint8Array(result)).toEqual(new Uint8Array(payload));
+				expect(requestUrl).toHaveBeenCalledWith(expect.objectContaining({
+					url: 'https://api.github.com/repos/testowner/testrepo/zipball/commit123',
+					method: 'GET',
+				}));
+			});
+
+			it('should include retry metadata when archive download hits rate limit', async () => {
+				(requestUrl as unknown as { mockResolvedValue: (value: unknown) => void }).mockResolvedValue({
+					status: 403,
+					arrayBuffer: new ArrayBuffer(0),
+					headers: { 'x-ratelimit-reset': '1777777777' },
+				});
+
+				await expect(vault.downloadArchiveZipball(COMMIT123_SHA)).rejects.toMatchObject({
+					details: { rateLimitResetAt: new Date(1777777777 * 1000).toISOString() }
+				});
+			});
+
+			it('should include retry metadata when blob fetch hits rate limit', async () => {
+				fakeOctokit.setupInitialState(COMMIT123_SHA, TREE456_SHA, [
+					{ path: 'test.md', mode: '100644', type: 'blob', sha: BLOB123_SHA }
+				]);
+				await vault.readFromSource();
+
+				const rateLimitError: any = new Error('API rate limit exceeded');
+				rateLimitError.status = 403;
+				rateLimitError.response = { headers: { 'x-ratelimit-reset': '1777777777' } };
+				fakeOctokit.simulateError('GET /repos/{owner}/{repo}/git/blobs/{file_sha}', rateLimitError);
+
+				await expect(vault.readFileContent('test.md')).rejects.toMatchObject({
+					details: { rateLimitResetAt: new Date(1777777777 * 1000).toISOString() }
+				});
+			});
+		});
+
 		describe("readFromSource", () => {
 			it("should fetch and update state from non-empty tree", async () => {
 				const mockTree: TreeNode[] = [

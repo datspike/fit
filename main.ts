@@ -15,6 +15,7 @@ import { CommitSha } from '@/util/hashing';
 import { FileStates } from '@/util/changeTracking';
 import { handleCriticalError } from '@/util/errorHandling';
 import { GitHubConnection } from '@/remotes/githubConnection';
+import { ArchiveBootstrapCheckpoint } from '@/util/archiveBootstrap';
 
 /**
  * Plugin configuration interface
@@ -64,6 +65,7 @@ export interface LocalStores {
 	localSha: FileStates                   // File path -> SHA cache
 	lastFetchedCommitSha: CommitSha | null // Last synced commit
 	lastFetchedRemoteSha: FileStates       // Remote file path -> SHA cache
+	archiveBootstrap?: ArchiveBootstrapCheckpoint | null
 }
 
 /**
@@ -517,7 +519,8 @@ export default class FitPlugin extends Plugin {
 	}
 
 	async loadLocalStore() {
-		const localStore = Object.assign({}, DEFAULT_LOCAL_STORE, await this.loadData());
+		const persisted = await this.loadData();
+		const localStore = Object.assign({}, DEFAULT_LOCAL_STORE, persisted);
 		const localStoreObj: LocalStores = Object.keys(DEFAULT_LOCAL_STORE).reduce(
 			(obj, key: keyof LocalStores) => {
 				if (localStore.hasOwnProperty(key)) {
@@ -525,6 +528,7 @@ export default class FitPlugin extends Plugin {
 				}
 				return obj;
 			}, {} as LocalStores);
+		localStoreObj.archiveBootstrap = persisted?.archiveBootstrap ?? null;
 		this.localStore = localStoreObj;
 	}
 

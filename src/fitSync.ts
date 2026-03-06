@@ -9,6 +9,13 @@ import { Base64Content, FileContent } from "./util/contentEncoding";
 import { detectNormalizationMismatches } from "./util/filePath";
 import { BlobSha, CommitSha } from "./util/hashing";
 import { LocalVault } from "./localVault";
+import {
+	ARCHIVE_BOOTSTRAP_LIMITS,
+	ArchiveBootstrapCheckpoint,
+	ArchiveBootstrapFallbackReason,
+	evaluateArchiveBootstrap,
+	extractArchiveEntries,
+} from './util/archiveBootstrap';
 
 const REMOTE_PULL_READ_CONCURRENCY = 8;
 
@@ -107,6 +114,15 @@ type SyncExecutionResult = {
 	conflicts: FileClash[];
 };
 
+type RemoteArchiveCapableVault = {
+	getTrackedTreeMetrics: (treeSha: string) => Promise<{
+		remoteTrackedFileCount: number;
+		remoteTrackedBlobBytes: number;
+		largestTrackedBlobBytes: number;
+	}>;
+	downloadArchiveZipball: (commitSha: CommitSha) => Promise<ArrayBuffer>;
+};
+
 export type ConflictResolutionResult = {
 	path: string;
 	conflictFile?: { path: string; content: FileContent; }; // Conflict to write to _fit/ (always _fit/ prefixed)
@@ -144,6 +160,200 @@ export class FitSync implements IFitSync {
 	constructor(fit: Fit, saveLocalStoreCallback: (localStore: Partial<LocalStores>) => Promise<void>) {
 		this.fit = fit;
 		this.saveLocalStoreCallback = saveLocalStoreCallback;
+	}
+
+	private formatLocalRetryTime(resetAt: string): string {
+		const date = new Date(resetAt);
+		const year = date.getFullYear();
+		const month = String(date.getMonth() + 1).padStart(2, '0');
+		const day = String(date.getDate()).padStart(2, '0');
+		const hours = String(date.getHours()).padStart(2, '0');
+		const minutes = String(date.getMinutes()).padStart(2, '0');
+		return `${year}-${month}-${day} ${hours}:${minutes}`;
+	}
+
+	private getArchiveFallbackMessage(reason: ArchiveBootstrapFallbackReason): string {
+		if (reason === 'archive-download-unavailable') {
+			return 'Archive bootstrap was unavailable for this initial sync. FIT will continue with the regular sync path optimized for iPhone.';
+		}
+
+		return 'Large initial sync detected. Archive bootstrap was skipped because the remote vault is above the safe mobile size limit for iPhone. FIT will continue with the regular sync path optimized for iPhone.';
+	}
+
+	private showStickyWarning(message: string): void {
+		const notice = new FitNotice(this.fit, [], message, 0);
+		notice.show();
+	}
+
+	private async saveArchiveCheckpoint(checkpoint: ArchiveBootstrapCheckpoint | null): Promise<void> {
+		await this.saveLocalStoreCallback({ archiveBootstrap: checkpoint });
+	}
+
+	private shouldAttemptArchiveBootstrap(
+		currentLocalState: FileStates,
+		filteredLocalChanges: FileChange[],
+		remoteChanges: FileChange[],
+		remoteCommitSha: CommitSha
+	): { shouldAttempt: boolean; checkpoint: ArchiveBootstrapCheckpoint | null; discardCheckpoint?: boolean } {
+		const checkpoint = this.fit.archiveBootstrap ?? null;
+		const localCacheEmpty = Object.keys(this.fit.localSha).length === 0;
+		const remoteCacheEmpty = Object.keys(this.fit.lastFetchedRemoteSha).length === 0;
+		const hasExistingCommit = this.fit.lastFetchedCommitSha !== null;
+
+		if (!localCacheEmpty || !remoteCacheEmpty || hasExistingCommit) {
+			return { shouldAttempt: false, checkpoint: null };
+		}
+
+		if (checkpoint && checkpoint.targetCommitSha !== remoteCommitSha) {
+			fitLogger.log('[FitSync] Discarding archive bootstrap checkpoint due to commit mismatch', {
+				checkpointCommitSha: checkpoint.targetCommitSha,
+				remoteCommitSha,
+			});
+			return { shouldAttempt: false, checkpoint: null, discardCheckpoint: true };
+		}
+
+		if (checkpoint) {
+			const completed = new Set(checkpoint.completedPaths);
+			const onlyCheckpointWrites = filteredLocalChanges.every(change =>
+				change.type === 'ADDED' && completed.has(change.path)
+			);
+			return { shouldAttempt: onlyCheckpointWrites, checkpoint };
+		}
+
+		const isTrulyEmptyLocalBootstrap = Object.keys(currentLocalState).length === 0 && filteredLocalChanges.length === 0;
+		const hasRemoteFiles = remoteChanges.some(change => change.type !== 'REMOVED');
+		return { shouldAttempt: isTrulyEmptyLocalBootstrap && hasRemoteFiles, checkpoint: null };
+	}
+
+	private async maybeRunArchiveBootstrap(
+		currentLocalState: FileStates,
+		filteredLocalChanges: FileChange[],
+		remoteChanges: FileChange[],
+		remoteTreeSha: FileStates,
+		remoteCommitSha: CommitSha,
+		remoteTreeRef: string,
+		syncNotice: FitNotice
+	): Promise<SyncResult | null> {
+		const { shouldAttempt, checkpoint, discardCheckpoint } = this.shouldAttemptArchiveBootstrap(
+			currentLocalState,
+			filteredLocalChanges,
+			remoteChanges,
+			remoteCommitSha
+		);
+
+		if (discardCheckpoint) {
+			await this.saveArchiveCheckpoint(null);
+			this.fit.archiveBootstrap = null;
+		}
+
+		if (!shouldAttempt) {
+			return null;
+		}
+
+		const archiveRemoteVault = this.fit.remoteVault as unknown as RemoteArchiveCapableVault;
+		if (!archiveRemoteVault.getTrackedTreeMetrics || !archiveRemoteVault.downloadArchiveZipball) {
+			return null;
+		}
+
+		const decision = evaluateArchiveBootstrap(await archiveRemoteVault.getTrackedTreeMetrics(remoteTreeRef));
+		if (!decision.shouldUseArchive) {
+			const fallbackReason = decision.fallbackReason ?? 'archive-download-unavailable';
+			fitLogger.log('[FitSync] Archive bootstrap skipped', { fallbackReason, ...decision.metrics });
+			this.showStickyWarning(this.getArchiveFallbackMessage(fallbackReason));
+			return null;
+		}
+
+		return await this.runArchiveBootstrap(
+			currentLocalState,
+			remoteTreeSha,
+			remoteCommitSha,
+			archiveRemoteVault,
+			checkpoint,
+			syncNotice
+		);
+	}
+
+	private async runArchiveBootstrap(
+		currentLocalState: FileStates,
+		remoteTreeSha: FileStates,
+		remoteCommitSha: CommitSha,
+		archiveRemoteVault: RemoteArchiveCapableVault,
+		checkpoint: ArchiveBootstrapCheckpoint | null,
+		syncNotice: FitNotice
+	): Promise<SyncResult> {
+		syncNotice.setMessage('Downloading initial snapshot');
+
+		const baseCheckpoint: ArchiveBootstrapCheckpoint = checkpoint ?? {
+			targetCommitSha: remoteCommitSha,
+			phase: 'download',
+			completedPaths: [],
+			writtenLocalSha: {},
+			updatedAt: new Date().toISOString(),
+		};
+		await this.saveArchiveCheckpoint(baseCheckpoint);
+		this.fit.archiveBootstrap = baseCheckpoint;
+
+		const zipball = await archiveRemoteVault.downloadArchiveZipball(remoteCommitSha);
+		const extractingCheckpoint: ArchiveBootstrapCheckpoint = {
+			...baseCheckpoint,
+			phase: 'extract',
+			updatedAt: new Date().toISOString(),
+		};
+		await this.saveArchiveCheckpoint(extractingCheckpoint);
+		this.fit.archiveBootstrap = extractingCheckpoint;
+
+		syncNotice.setMessage('Writing remote changes to local');
+		const extractedEntries = extractArchiveEntries(zipball, (path) => this.fit.shouldSyncPath(path));
+		const completedPaths = new Set(extractingCheckpoint.completedPaths);
+		const localOps: FileChange[] = [];
+		let accumulatedLocalSha: FileStates = { ...extractingCheckpoint.writtenLocalSha };
+
+		for (let index = 0; index < extractedEntries.length; index += ARCHIVE_BOOTSTRAP_LIMITS.writeBatchSize) {
+			const batch = extractedEntries
+				.slice(index, index + ARCHIVE_BOOTSTRAP_LIMITS.writeBatchSize)
+				.filter(entry => !completedPaths.has(entry.path));
+
+			if (batch.length === 0) {
+				continue;
+			}
+
+			const batchResult = await this.fit.localVault.applyChanges(batch, [], { clashPaths: new Set() });
+			localOps.push(...batchResult.changes);
+			accumulatedLocalSha = { ...accumulatedLocalSha, ...(await batchResult.newBaselineStates) };
+
+			for (const entry of batch) {
+				completedPaths.add(entry.path);
+			}
+
+			const updatedCheckpoint: ArchiveBootstrapCheckpoint = {
+				targetCommitSha: remoteCommitSha,
+				phase: 'write',
+				completedPaths: Array.from(completedPaths).sort(),
+				writtenLocalSha: accumulatedLocalSha,
+				updatedAt: new Date().toISOString(),
+			};
+			await this.saveArchiveCheckpoint(updatedCheckpoint);
+			this.fit.archiveBootstrap = updatedCheckpoint;
+		}
+
+		const newLocalState = this.fit.filterSyncedState({ ...currentLocalState, ...accumulatedLocalSha });
+		await this.saveLocalStoreCallback({
+			localSha: newLocalState,
+			lastFetchedRemoteSha: remoteTreeSha,
+			lastFetchedCommitSha: remoteCommitSha,
+			archiveBootstrap: null,
+		});
+		this.fit.archiveBootstrap = null;
+
+		syncNotice.setMessage('Sync successful');
+		return {
+			success: true,
+			changeGroups: [
+				{ heading: 'Local file updates:', changes: localOps },
+				{ heading: 'Remote file updates:', changes: [] },
+			],
+			clash: [],
+		};
 	}
 
 	/**
@@ -622,9 +832,22 @@ export class FitSync implements IFitSync {
 
 			// Both succeeded, extract values
 			const {changes: localChanges, state: currentLocalState} = localResult.value;
-			const {changes: remoteChanges, state: remoteTreeSha, commitSha: remoteCommitSha} = remoteResult.value;
+			const {changes: remoteChanges, state: remoteTreeSha, commitSha: remoteCommitSha, treeSha: remoteTreeRef} = remoteResult.value;
 			fitLogger.log('.. ✅ [Sync] Change detection complete');
 			const filteredLocalChanges = localChanges.filter(c => this.fit.shouldSyncPath(c.path));
+
+			const archiveBootstrapResult = await this.maybeRunArchiveBootstrap(
+				currentLocalState,
+				filteredLocalChanges,
+				remoteChanges,
+				remoteTreeSha,
+				remoteCommitSha,
+				remoteTreeRef,
+				syncNotice
+			);
+			if (archiveBootstrapResult) {
+				return archiveBootstrapResult;
+			}
 
 			// Log detected changes for diagnostics
 			const localCount = filteredLocalChanges.length;
@@ -814,9 +1037,18 @@ export class FitSync implements IFitSync {
 	 */
 	getSyncErrorMessage(syncError: SyncError): string {
 		let baseMessage: string;
+		const rateLimitResetAt = syncError instanceof VaultError ? syncError.details?.rateLimitResetAt : undefined;
+		const isRateLimited = syncError instanceof VaultError && /rate limit/i.test(syncError.message);
 
 		// Handle VaultError types (thrown by LocalVault and RemoteGitHubVault)
 		if (syncError instanceof VaultError) {
+			if (isRateLimited) {
+				if (rateLimitResetAt) {
+					return `GitHub rate limit reached. Try again after ${this.formatLocalRetryTime(rateLimitResetAt)} local time.`;
+				}
+				return 'GitHub rate limit reached.';
+			}
+
 			switch (syncError.type) {
 				case 'network':
 					baseMessage = `${syncError.message}. Please check your internet connection.`;

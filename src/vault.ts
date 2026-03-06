@@ -88,6 +88,7 @@ export class VaultError extends Error {
 			originalError?: unknown;
 			failedPaths?: string[];
 			errors?: Array<{ path: string; error: unknown }>;
+			rateLimitResetAt?: string;
 		}
 	) {
 		super(message);
@@ -100,6 +101,7 @@ export class VaultError extends Error {
 			originalError?: unknown;
 			failedPaths?: string[];
 			errors?: Array<{ path: string; error: unknown }>;
+			rateLimitResetAt?: string;
 		}) =>
 			new VaultError(type, message, details);
 	}

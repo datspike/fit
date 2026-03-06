@@ -7,6 +7,7 @@
 
 import { Octokit } from "@octokit/core";
 import { retry } from "@octokit/plugin-retry";
+import { requestUrl } from 'obsidian';
 import { ApplyChangesResult, IVault, VaultError, VaultReadResult } from "./vault";
 import { FileChange, FileStates } from "./util/changeTracking";
 import { BlobSha, CommitSha, EMPTY_TREE_SHA, TreeSha } from "./util/hashing";
@@ -15,6 +16,7 @@ import { detectNormalizationIssues } from "./util/filePath";
 import { withSlowOperationMonitoring } from "./util/asyncMonitoring";
 import { fitLogger } from "./logger";
 import { detectSuspiciousCorrespondence } from "./util/pathPattern";
+import { ArchiveBootstrapTreeMetrics } from './util/archiveBootstrap';
 
 /**
  * Represents a node in GitHub's git tree structure
@@ -23,6 +25,7 @@ import { detectSuspiciousCorrespondence } from "./util/pathPattern";
 export type TreeNode = {
 	path: string,
 	mode: "100644" | "100755" | "040000" | "160000" | "120000" | undefined
+	size?: number
 } & (
 	| { type: "commit", sha: CommitSha | null }
 	| { type: "blob", sha: BlobSha | null }
@@ -52,6 +55,7 @@ export class RemoteGitHubVault implements IVault<"remote"> {
 	private repo: string;
 	private branch: string;
 	private headers: {[k: string]: string};
+	private pat: string;
 	private deviceName: string;
 	private repoExistsCache: boolean | null = null;
 
@@ -67,6 +71,7 @@ export class RemoteGitHubVault implements IVault<"remote"> {
 		branch: string,
 		deviceName: string
 	) {
+		this.pat = pat;
 		// Use Octokit with retry plugin for enhanced rate limiting handling
 		const OctokitWithRetry = Octokit.plugin(retry);
 		this.octokit = new OctokitWithRetry({
@@ -118,6 +123,15 @@ export class RemoteGitHubVault implements IVault<"remote"> {
 		notFoundStrategy: 'repo' | 'repo-or-branch' | 'ignore'
 	): Promise<never> {
 		const errorObj = error as { status?: number | null; response?: unknown; message?: string };
+		const rateLimitResetAt = this.getRateLimitResetAt((errorObj.response as { headers?: unknown } | undefined)?.headers);
+		const errorMessage = errorObj.message || 'Request failed';
+
+		if ((errorObj.status === 403 || errorObj.status === 429) && /rate limit/i.test(errorMessage)) {
+			throw VaultError.network('GitHub rate limit reached', {
+				originalError: error,
+				rateLimitResetAt
+			});
+		}
 
 		// No status or no response indicates network/connectivity issue
 		if (errorObj.status === null || errorObj.status === undefined || !errorObj.response) {
@@ -152,7 +166,7 @@ export class RemoteGitHubVault implements IVault<"remote"> {
 		if (errorObj.status === 401 || errorObj.status === 403) {
 			throw VaultError.authentication(
 				errorObj.message || 'Authentication failed',
-				{ originalError: error }
+				{ originalError: error, rateLimitResetAt }
 			);
 		}
 
@@ -201,6 +215,70 @@ export class RemoteGitHubVault implements IVault<"remote"> {
 		} catch (error) {
 			return await this.wrapOctokitError(error, 'repo-or-branch');
 		}
+	}
+
+	private getRateLimitResetAt(headers: unknown): string | undefined {
+		if (!headers || typeof headers !== 'object') {
+			return undefined;
+		}
+		const rawReset = (headers as Record<string, unknown>)['x-ratelimit-reset'];
+		if (typeof rawReset !== 'string' && typeof rawReset !== 'number') {
+			return undefined;
+		}
+		const seconds = Number(rawReset);
+		if (!Number.isFinite(seconds)) {
+			return undefined;
+		}
+		return new Date(seconds * 1000).toISOString();
+	}
+
+	async getTrackedTreeMetrics(treeSha: TreeSha): Promise<ArchiveBootstrapTreeMetrics> {
+		const tree = treeSha === EMPTY_TREE_SHA ? [] : await this.getTree(treeSha);
+		let remoteTrackedFileCount = 0;
+		let remoteTrackedBlobBytes = 0;
+		let largestTrackedBlobBytes = 0;
+
+		for (const node of tree) {
+			if (node.type !== 'blob' || !node.path || !node.sha) {
+				continue;
+			}
+			const size = typeof node.size === 'number' ? node.size : 0;
+			remoteTrackedFileCount += 1;
+			remoteTrackedBlobBytes += size;
+			largestTrackedBlobBytes = Math.max(largestTrackedBlobBytes, size);
+		}
+
+		return {
+			remoteTrackedFileCount,
+			remoteTrackedBlobBytes,
+			largestTrackedBlobBytes,
+		};
+	}
+
+	async downloadArchiveZipball(commitSha: CommitSha): Promise<ArrayBuffer> {
+		const response = await requestUrl({
+			url: `https://api.github.com/repos/${this.owner}/${this.repo}/zipball/${commitSha}`,
+			method: 'GET',
+			headers: {
+				Authorization: `Bearer ${this.pat}`,
+				Accept: 'application/vnd.github+json',
+				'X-GitHub-Api-Version': '2022-11-28'
+			},
+			throw: false,
+		});
+
+		if (response.status >= 400) {
+			const rateLimitResetAt = this.getRateLimitResetAt(response.headers);
+			if ((response.status === 403 || response.status === 429) && rateLimitResetAt) {
+				throw VaultError.network('GitHub rate limit reached', { rateLimitResetAt });
+			}
+			if (response.status === 401 || response.status === 403) {
+				throw VaultError.authentication('Archive download failed', { rateLimitResetAt });
+			}
+			throw VaultError.network(`Archive download failed with status ${response.status}`);
+		}
+
+		return response.arrayBuffer;
 	}
 
 

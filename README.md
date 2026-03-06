@@ -63,6 +63,9 @@ See [Common Issues](#common-issues) below for detailed conflict resolution steps
 
 - It is advised to use a new repo for syncing an existing vault, to minimize the chance of file name conflict on the first sync
 - If your existing vault or repo is large, the initial sync would take longer and require a good internet connection
+- On mobile, FIT now prefers an archive bootstrap for a truly empty first sync when the remote vault stays within a conservative safe-size threshold (up to 2500 files, 80 MiB total tracked blob size, 20 MiB largest blob)
+- If the remote vault is above that mobile-safe limit, FIT falls back to the regular per-file sync path and shows an explicit warning instead of silently attempting a risky archive download
+- If GitHub rate limiting blocks sync, FIT shows when retry is safe again using your device's local time when GitHub provides a reset timestamp
 
 ### Manually trigger sync on Obsidian mobile
 
