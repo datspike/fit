@@ -1286,6 +1286,43 @@ describe('FitSync', () => {
 	});
 
 	describe('Per-File Error Handling', () => {
+		it('should bound concurrent remote reads during initial pull of many files', async () => {
+			const fitSync = createFitSync();
+			const fileCount = 20;
+			let activeReads = 0;
+			let maxActiveReads = 0;
+			const originalReadFileContent = remoteVault.readFileContent.bind(remoteVault);
+
+			for (let index = 0; index < fileCount; index += 1) {
+				await remoteVault.setFile(`bulk/file-${index}.md`, `content-${index}`);
+			}
+
+			remoteVault.readFileContent = vi.fn(async (path: string) => {
+				activeReads += 1;
+				maxActiveReads = Math.max(maxActiveReads, activeReads);
+				await new Promise(resolve => setTimeout(resolve, 10));
+				try {
+					return await originalReadFileContent(path);
+				} finally {
+					activeReads -= 1;
+				}
+			});
+
+			const mockNotice = createMockNotice();
+			const result = await syncAndHandleResult(fitSync, mockNotice);
+
+			expect(result).toEqual(expect.objectContaining({ success: true }));
+			expect(maxActiveReads).toBeLessThanOrEqual(8);
+			expect(Object.keys(localStoreState.localSha)).toHaveLength(fileCount);
+			expect(fitLoggerLogSpy).toHaveBeenCalledWith(
+				'[FitSync] Reading remote additions with bounded concurrency',
+				expect.objectContaining({
+					fileCount,
+					concurrency: 8
+				})
+			);
+		});
+
 		it('should handle per-file read failures from local vault with detailed error message', async () => {
 			// Arrange
 			const fitSync = createFitSync();

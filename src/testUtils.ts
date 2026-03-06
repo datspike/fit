@@ -168,7 +168,7 @@ export class FakeOctokit {
 	private refs: Map<string, CommitSha> = new Map(); // ref name -> commit SHA
 	private commits: Map<CommitSha, { tree: TreeSha; parents: CommitSha[]; message: string }> = new Map();
 	private trees: Map<TreeSha, TreeNode[]> = new Map();
-	private blobs: Map<BlobSha, string> = new Map(); // blob SHA -> content
+	private blobs: Map<BlobSha, unknown> = new Map(); // blob SHA -> response payload
 	private repoExists: boolean = true; // Simulate whether repository exists
 	private errorSimulations: Map<string, Error> = new Map(); // route -> error to throw
 
@@ -206,7 +206,14 @@ export class FakeOctokit {
 	 * Add a blob to the fake repository.
 	 */
 	addBlob(sha: BlobSha, content: string): void {
-		this.blobs.set(sha, content);
+		this.blobs.set(sha, { content });
+	}
+
+	/**
+	 * Add a raw blob payload to the fake repository.
+	 */
+	addBlobPayload(sha: BlobSha, payload: unknown): void {
+		this.blobs.set(sha, payload);
 	}
 
 	/**
@@ -287,11 +294,11 @@ export class FakeOctokit {
 		// GET /repos/{owner}/{repo}/git/blobs/{file_sha}
 		if (route === "GET /repos/{owner}/{repo}/git/blobs/{file_sha}") {
 			const blobSha = params.file_sha;
-			const content = this.blobs.get(blobSha);
-			if (!content) {
+			const payload = this.blobs.get(blobSha);
+			if (payload === undefined) {
 				throw new Error(`Blob not found: ${blobSha}`);
 			}
-			return { data: { content } };
+			return { data: payload };
 		}
 
 		// POST /repos/{owner}/{repo}/git/blobs

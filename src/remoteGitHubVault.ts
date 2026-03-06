@@ -241,7 +241,26 @@ export class RemoteGitHubVault implements IVault<"remote"> {
 					file_sha: blobSha,
 					headers: this.headers
 				});
-			return FileContent.fromBase64(blob.content);
+			const blobPayload = blob as { content?: unknown; encoding?: unknown; size?: unknown } | null | undefined;
+			const blobContent = blobPayload?.content;
+
+			if (typeof blobContent !== 'string') {
+				const hasContentField = blob !== null && typeof blob === 'object' && 'content' in blob;
+				fitLogger.log('[RemoteGitHubVault] Invalid blob payload received from GitHub API', {
+					path,
+					blobSha,
+					hasContentField,
+					contentType: typeof blobContent,
+					encoding: blobPayload?.encoding,
+					size: blobPayload?.size
+				});
+				throw new Error(
+					`Invalid blob payload for '${path}' (blob ${blobSha}): ` +
+					`expected base64 string content, got ${typeof blobContent}`
+				);
+			}
+
+			return FileContent.fromBase64(blobContent);
 		} catch (error) {
 			// Blob not found (404) is a data error, not a vault-level error
 			// Network/auth errors still converted to VaultError

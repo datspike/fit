@@ -168,6 +168,32 @@ describe("RemoteGitHubVault", () => {
 				const content2 = await vault.readFileContent("file2.md");
 				expect(content2).toEqual(FileContent.fromBase64("content2"));
 			});
+
+			it('should fail with blob diagnostics when GitHub blob payload has no string content', async () => {
+				const mockTree: TreeNode[] = [
+					{ path: 'test.md', mode: '100644', type: 'blob', sha: BLOB123_SHA }
+				];
+				fakeOctokit.setupInitialState(COMMIT123_SHA, TREE456_SHA, mockTree);
+				fakeOctokit.addBlobPayload(BLOB123_SHA, { encoding: 'base64', size: 1234 });
+
+				await vault.readFromSource();
+
+				await expect(vault.readFileContent('test.md')).rejects.toThrow(
+					"Invalid blob payload for 'test.md' (blob sha123): expected base64 string content, got undefined"
+				);
+
+				expect(fitLogger.log).toHaveBeenCalledWith(
+					'[RemoteGitHubVault] Invalid blob payload received from GitHub API',
+					expect.objectContaining({
+						path: 'test.md',
+						blobSha: BLOB123_SHA,
+						hasContentField: false,
+						contentType: 'undefined',
+						encoding: 'base64',
+						size: 1234
+					})
+				);
+			});
 		});
 
 		describe("Caching", () => {

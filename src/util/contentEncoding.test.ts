@@ -123,4 +123,10 @@ describe('FileContent', () => {
 
 		expect(fileContent.toBase64()).toBe(binaryBase64);
 	});
+
+	it('should fail fast when base64 input is not a string', () => {
+		expect(() => FileContent.fromBase64(undefined as never)).toThrow(
+			'Expected base64 content to be a string, got undefined'
+		);
+	});
 });

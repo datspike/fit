@@ -10,6 +10,33 @@ import { detectNormalizationMismatches } from "./util/filePath";
 import { BlobSha, CommitSha } from "./util/hashing";
 import { LocalVault } from "./localVault";
 
+const REMOTE_PULL_READ_CONCURRENCY = 8;
+
+async function mapWithConcurrencyLimit<T, TResult>(
+	items: T[],
+	concurrency: number,
+	mapper: (item: T, index: number) => Promise<TResult>
+): Promise<TResult[]> {
+	if (items.length === 0) {
+		return [];
+	}
+
+	const results = new Array<TResult>(items.length);
+	let nextIndex = 0;
+
+	const worker = async () => {
+		while (nextIndex < items.length) {
+			const currentIndex = nextIndex;
+			nextIndex += 1;
+			results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+		}
+	};
+
+	const workerCount = Math.min(concurrency, items.length);
+	await Promise.all(Array.from({ length: workerCount }, () => worker()));
+	return results;
+}
+
 // Helper to log SHA cache updates with provenance tracking
 function logCacheUpdate(
 	source: string,
@@ -434,24 +461,34 @@ export class FitSync implements IFitSync {
 	): Promise<SyncExecutionResult> {
 		// Prepare safe remote changes for pulling
 		const deleteFromLocalNonClashed = safeRemote.filter(c => c.type === "REMOVED").map(c => c.path);
-		const addToLocalNonClashed = await Promise.all(
-			safeRemote
-				.filter(c => c.type !== "REMOVED")
-				.map(async (change) => ({
-					path: change.path,
-					content: await this.fit.remoteVault.readFileContent(change.path)
-				}))
+		const remoteAdditions = safeRemote.filter(c => c.type !== "REMOVED");
+
+		if (remoteAdditions.length > REMOTE_PULL_READ_CONCURRENCY) {
+			fitLogger.log('[FitSync] Reading remote additions with bounded concurrency', {
+				fileCount: remoteAdditions.length,
+				concurrency: REMOTE_PULL_READ_CONCURRENCY
+			});
+		}
+
+		const addToLocalNonClashed = await mapWithConcurrencyLimit(
+			remoteAdditions,
+			REMOTE_PULL_READ_CONCURRENCY,
+			async (change) => ({
+				path: change.path,
+				content: await this.fit.remoteVault.readFileContent(change.path)
+			})
 		);
 
 		// Phase 3: Execute sync operations
 		// Prepare clash files for writing to _fit/ directory
-		const clashFiles = await Promise.all(
-			clashes
-				.filter(c => c.remoteOp !== 'REMOVED') // Skip deletions
-				.map(async (clash) => {
-					const content = await this.fit.remoteVault.readFileContent(clash.path);
-					return this.prepareConflictFile(clash.path, content.toBase64());
-				})
+		const clashedRemoteFiles = clashes.filter(c => c.remoteOp !== 'REMOVED');
+		const clashFiles = await mapWithConcurrencyLimit(
+			clashedRemoteFiles,
+			REMOTE_PULL_READ_CONCURRENCY,
+			async (clash) => {
+				const content = await this.fit.remoteVault.readFileContent(clash.path);
+				return this.prepareConflictFile(clash.path, content.toBase64());
+			}
 		);
 
 		// 3a. Push local changes to remote
